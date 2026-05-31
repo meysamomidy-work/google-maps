@@ -1,5 +1,5 @@
 """
-Scrape Google Maps phone/website for dealerships from per-state Excel files.
+Scrape Google Maps phone/website for dealerships from per-state CSV files.
 
 Usage:
     python main.py -w 0 -W 4   # worker 0 of 4 (0-based worker id)
@@ -25,9 +25,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from tqdm import tqdm
 from webdriver_manager.chrome import ChromeDriverManager
 
-EXCELS_DIR = Path("excels")
-OUTPUT_DIR = Path("excels_new")
-SKIP_FILES = {"all_dealerships.xlsx"}
+INPUT_DIR = Path("crawled")
+OUTPUT_DIR = Path("crawled_new")
+SKIP_FILES = {"all_dealerships.csv"}
 
 GOOGLE_MAPS_URL_COL = "google maps url"
 GOOGLE_MAP_PHONE_COL = "Google Map Phone"
@@ -50,6 +50,19 @@ def preprocess_dealership_name(name: object) -> str:
     text = text.replace("&", " and ")
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def format_us_phone(phone: str) -> str:
+    """Format phone as (205) 574-2854 when it is a US 10-digit number."""
+    if not phone or not str(phone).strip():
+        return ""
+    raw = str(phone).strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return raw
 
 
 def preprocess_address(address: object) -> str:
@@ -111,6 +124,7 @@ def extract_phone_and_website(driver: webdriver.Chrome) -> tuple[str, str]:
         )
         label = driver.find_element(By.XPATH, PHONE_XPATH).get_attribute("aria-label") or ""
         phone = label.replace("Call: ", "").replace("Phone: ", "").strip()
+        phone = format_us_phone(phone)
     except Exception:
         pass
 
@@ -120,7 +134,7 @@ def extract_phone_and_website(driver: webdriver.Chrome) -> tuple[str, str]:
 def list_state_files() -> list[Path]:
     files = sorted(
         f
-        for f in EXCELS_DIR.glob("*.xlsx")
+        for f in INPUT_DIR.glob("*.csv")
         if f.is_file() and f.name not in SKIP_FILES
     )
     return files
@@ -130,11 +144,15 @@ def states_for_worker(state_files: list[Path], worker_id: int, total_workers: in
     return [f for i, f in enumerate(state_files) if i % total_workers == worker_id]
 
 
+def read_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
 def prepare_dataframe(source_path: Path, output_path: Path) -> pd.DataFrame:
     """Load source rows; resume from partial output if present."""
-    source = pd.read_excel(source_path)
+    source = read_csv(source_path)
     if output_path.exists():
-        existing = pd.read_excel(output_path)
+        existing = read_csv(output_path)
         if len(existing) == len(source):
             for col in (GOOGLE_MAPS_URL_COL, GOOGLE_MAP_PHONE_COL, GOOGLE_MAP_WEBSITE_COL):
                 if col not in existing.columns:
@@ -170,7 +188,7 @@ def row_needs_scrape(row: pd.Series) -> bool:
 
 def write_output(df: pd.DataFrame, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(output_path, index=False)
+    df.to_csv(output_path, index=False, encoding="utf-8")
 
 
 def process_state(source_path: Path, output_path: Path) -> None:
@@ -212,7 +230,7 @@ def process_state(source_path: Path, output_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scrape Google Maps data for dealership Excel files by state."
+        description="Scrape Google Maps data for dealership CSV files by state."
     )
     parser.add_argument(
         "-w",
@@ -238,12 +256,12 @@ def main() -> None:
     if args.worker_id < 0 or args.worker_id >= args.total_workers:
         raise SystemExit(f"worker-id (-w) must be between 0 and {args.total_workers - 1}")
 
-    if not EXCELS_DIR.is_dir():
-        raise SystemExit(f"Missing input folder: {EXCELS_DIR}")
+    if not INPUT_DIR.is_dir():
+        raise SystemExit(f"Missing input folder: {INPUT_DIR}")
 
     state_files = list_state_files()
     if not state_files:
-        raise SystemExit(f"No state Excel files found in {EXCELS_DIR}")
+        raise SystemExit(f"No state CSV files found in {INPUT_DIR}")
 
     my_states = states_for_worker(state_files, args.worker_id, args.total_workers)
     print(

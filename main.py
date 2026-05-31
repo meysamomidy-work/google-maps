@@ -1,115 +1,263 @@
-import time
-import pandas as pd
-from glob import glob
-import random
-from turtle import distance
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from tqdm import tqdm
-from webdriver_manager.chrome import ChromeDriverManager
-import psutil
+"""
+Scrape Google Maps phone/website for dealerships from per-state Excel files.
+
+Usage:
+    python main.py -w 0 -W 4   # worker 0 of 4 (0-based worker id)
+"""
+
+from __future__ import annotations
+
+import argparse
 import gc
 import os
-import threading
+import re
+import urllib.parse
+from pathlib import Path
+
+import pandas as pd
+import psutil
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from tqdm import tqdm
+from webdriver_manager.chrome import ChromeDriverManager
+
+EXCELS_DIR = Path("excels")
+OUTPUT_DIR = Path("excels_new")
+SKIP_FILES = {"all_dealerships.xlsx"}
+
+GOOGLE_MAPS_URL_COL = "google maps url"
+GOOGLE_MAP_PHONE_COL = "Google Map Phone"
+GOOGLE_MAP_WEBSITE_COL = "Google Map Website"
+
+WEBSITE_XPATH = '//a[@data-tooltip="Open website"]'
+PHONE_XPATH = '//button[@data-tooltip="Copy phone number"]'
 
 
+def preprocess_dealership_name(name: object) -> str:
+    """Normalize dealership names for Google Maps search (e.g. A & M -> A and M)."""
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    text = str(name).strip()
+    # Spaced ampersand: "H & M", "A & M"
+    text = re.sub(r"\s*&\s*", " and ", text)
+    # Tight ampersand: "J&S", "A&M"
+    text = re.sub(r"(\w)&(\w)", r"\1 and \2", text, flags=re.IGNORECASE)
+    # Remaining ampersands
+    text = text.replace("&", " and ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-def get_memory_usage():
-    """Get current memory usage in MB"""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
+
+def preprocess_address(address: object) -> str:
+    if address is None or (isinstance(address, float) and pd.isna(address)):
+        return ""
+    return re.sub(r"\s+", " ", str(address).strip())
 
 
-def cleanup_memory():
-    """Force garbage collection to free memory"""
+def build_google_maps_url(name: object, address: object) -> str:
+    """Build Google Maps search URL like file.ipynb, with proper encoding."""
+    query = f"{preprocess_dealership_name(name)} {preprocess_address(address)}".strip()
+    encoded = urllib.parse.quote(query, safe="")
+    return f"https://www.google.com/maps/search/?api=1&query={encoded}"
+
+
+def get_memory_usage_mb() -> float:
+    return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+
+
+def cleanup_memory() -> None:
     gc.collect()
 
 
-def create_driver():
-    """Create a new Chrome driver with memory-optimized settings"""
+def create_driver() -> webdriver.Chrome:
     chrome_options = Options()
-    
-    # Memory optimization settings
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--disable-plugins")
-    chrome_options.add_argument("--disable-images")  # Don't load images to save memory
-    chrome_options.add_argument("--disable-javascript")  # Disable JS if not needed
     chrome_options.add_argument("--memory-pressure-off")
-    chrome_options.add_argument("--max_old_space_size=4096")  # Limit memory usage
-    
-    # Performance settings
     chrome_options.add_argument("--disable-background-timer-throttling")
     chrome_options.add_argument("--disable-backgrounding-occluded-windows")
     chrome_options.add_argument("--disable-renderer-backgrounding")
-    
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=chrome_options,
+    )
     driver.maximize_window()
     return driver
 
 
-def run(file):
+def extract_phone_and_website(driver: webdriver.Chrome) -> tuple[str, str]:
+    website = ""
+    phone = ""
+
+    try:
+        WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((By.XPATH, WEBSITE_XPATH))
+        )
+        website = driver.find_element(By.XPATH, WEBSITE_XPATH).get_attribute("href") or ""
+    except Exception:
+        pass
+
+    try:
+        WebDriverWait(driver, 2).until(
+            EC.presence_of_element_located((By.XPATH, PHONE_XPATH))
+        )
+        label = driver.find_element(By.XPATH, PHONE_XPATH).get_attribute("aria-label") or ""
+        phone = label.replace("Call: ", "").replace("Phone: ", "").strip()
+    except Exception:
+        pass
+
+    return phone, website
+
+
+def list_state_files() -> list[Path]:
+    files = sorted(
+        f
+        for f in EXCELS_DIR.glob("*.xlsx")
+        if f.is_file() and f.name not in SKIP_FILES
+    )
+    return files
+
+
+def states_for_worker(state_files: list[Path], worker_id: int, total_workers: int) -> list[Path]:
+    return [f for i, f in enumerate(state_files) if i % total_workers == worker_id]
+
+
+def prepare_dataframe(source_path: Path, output_path: Path) -> pd.DataFrame:
+    """Load source rows; resume from partial output if present."""
+    source = pd.read_excel(source_path)
+    if output_path.exists():
+        existing = pd.read_excel(output_path)
+        if len(existing) == len(source):
+            for col in (GOOGLE_MAPS_URL_COL, GOOGLE_MAP_PHONE_COL, GOOGLE_MAP_WEBSITE_COL):
+                if col not in existing.columns:
+                    existing[col] = ""
+            return existing
+        print(f"  warning: {output_path.name} row count mismatch; rebuilding from source")
+
+    df = source.copy()
+    for col in (GOOGLE_MAP_PHONE_COL, GOOGLE_MAP_WEBSITE_COL):
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+
+    if GOOGLE_MAPS_URL_COL not in df.columns:
+        df[GOOGLE_MAPS_URL_COL] = ""
+
+    for idx in df.index:
+        url = df.at[idx, GOOGLE_MAPS_URL_COL]
+        if pd.isna(url) or not str(url).strip():
+            df.at[idx, GOOGLE_MAPS_URL_COL] = build_google_maps_url(
+                df.at[idx, "Name"],
+                df.at[idx, "List Address"],
+            )
+    return df
+
+
+def row_needs_scrape(row: pd.Series) -> bool:
+    """Skip rows already scraped (phone or website found, or retry only empty both)."""
+    phone = str(row.get(GOOGLE_MAP_PHONE_COL, "") or "").strip()
+    website = str(row.get(GOOGLE_MAP_WEBSITE_COL, "") or "").strip()
+    return not phone and not website
+
+
+def write_output(df: pd.DataFrame, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(output_path, index=False)
+
+
+def process_state(source_path: Path, output_path: Path) -> None:
+    state_name = source_path.stem
+    df = prepare_dataframe(source_path, output_path)
+    print(f"********* {state_name} started ({len(df)} rows) *********")
+
     driver = create_driver()
-    df = pd.read_excel(file)
-    # df.drop(columns=['Zip Code', 'State'], inplace=True)
-    df.drop_duplicates(inplace=True)
-    # df = df[df["Unclaimed Status"] == True]
-    state = file.split("\\")[-1].split("-")[0].split(".")[0]
-    state = state.split("/")[-1]
-    print(f"********* {state} started *********")
-    url_count = 0
-    for loc in tqdm(df["google maps url"]):
-        website, phone = '', ''
-        url_count += 1
-        driver.get(loc)
-        
-        try:
-            # website_selectors = 'div.rogA2c.ITvuef div.Io6YTe.fontBodyMedium'
-            website_selectors = '//a[@data-tooltip="Open website"]'
-            WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, website_selectors)))
-            website = driver.find_element(By.XPATH, website_selectors).get_attribute('href')
-            print(f"Website found : {website}")
+    try:
+        for idx in tqdm(range(len(df)), desc=state_name):
+            row = df.iloc[idx]
+            if not row_needs_scrape(row):
+                continue
 
-        except:
-            pass
+            url = row[GOOGLE_MAPS_URL_COL]
+            if not url or (isinstance(url, float) and pd.isna(url)):
+                url = build_google_maps_url(row.get("Name"), row.get("List Address"))
+                df.at[idx, GOOGLE_MAPS_URL_COL] = url
 
-        try:
-            phone_selectors = '//button[@data-tooltip="Copy phone number"]'
-            WebDriverWait(driver, 1).until(EC.presence_of_element_located((By.XPATH, phone_selectors)))
-            phone = driver.find_element(By.XPATH, phone_selectors).get_attribute('aria-label').replace('Call: ', '').replace('Phone: ', '')
-            print(f"Phone found : {phone}")
-        except:
-            pass
+            phone, website = "", ""
+            try:
+                driver.get(url)
+                phone, website = extract_phone_and_website(driver)
+            except Exception as exc:
+                print(f"  row {idx}: scrape error: {exc}")
+
+            df.at[idx, GOOGLE_MAP_PHONE_COL] = phone
+            df.at[idx, GOOGLE_MAP_WEBSITE_COL] = website
+            write_output(df, output_path)
+
+            if (idx + 1) % 10 == 0:
+                cleanup_memory()
+                print(f"  memory: {get_memory_usage_mb():.1f} MB")
+    finally:
+        driver.quit()
+
+    print(f"********* {state_name} finished -> {output_path} *********")
 
 
-        with open(f"{state}.csv", "a", encoding="utf-8") as f:
-            f.write(f"{loc}|{website}|{phone}\n")
-        
-        cleanup_memory()
-        if url_count % 10 == 0:
-            print(f"Memory usage: {get_memory_usage():.1f} MB")
-        
-    driver.quit()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scrape Google Maps data for dealership Excel files by state."
+    )
+    parser.add_argument(
+        "-w",
+        "--worker-id",
+        type=int,
+        required=True,
+        help="This worker's id (0-based). States are assigned where index %% total_workers == worker_id.",
+    )
+    parser.add_argument(
+        "-W",
+        "--total-workers",
+        type=int,
+        required=True,
+        help="Total number of workers splitting states.",
+    )
+    return parser.parse_args()
 
-# run("reduced_crawled/Texas.csv")
-# t1 = threading.Thread(target=run, args=("reduced_crawled/California.csv",))
-# t2 = threading.Thread(target=run, args=("reduced_crawled/NewYork.csv",))
-t3 = threading.Thread(target=run, args=("prepared_to_google.xlsx",))
-# t4 = threading.Thread(target=run, args=("prepared_to_google/NY_1.xlsx",))
-# t1.start()
-# t2.start()
-t3.start()
-# t4.start()
-# t1.join()
-# t2.join()
-t3.join()
-# t4.join()
-# //a[@data-tooltip="Open website"]
-# //button[@data-tooltip="Copy phone number"]
+
+def main() -> None:
+    args = parse_args()
+    if args.total_workers < 1:
+        raise SystemExit("total-workers (-W) must be at least 1")
+    if args.worker_id < 0 or args.worker_id >= args.total_workers:
+        raise SystemExit(f"worker-id (-w) must be between 0 and {args.total_workers - 1}")
+
+    if not EXCELS_DIR.is_dir():
+        raise SystemExit(f"Missing input folder: {EXCELS_DIR}")
+
+    state_files = list_state_files()
+    if not state_files:
+        raise SystemExit(f"No state Excel files found in {EXCELS_DIR}")
+
+    my_states = states_for_worker(state_files, args.worker_id, args.total_workers)
+    print(
+        f"Worker {args.worker_id}/{args.total_workers}: "
+        f"{len(my_states)} of {len(state_files)} states"
+    )
+    for path in my_states:
+        print(f"  - {path.stem}")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for source_path in my_states:
+        output_path = OUTPUT_DIR / source_path.name
+        process_state(source_path, output_path)
+
+
+if __name__ == "__main__":
+    main()

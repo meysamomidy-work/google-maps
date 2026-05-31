@@ -1,5 +1,9 @@
 """
-Scrape Google Maps phone/website for dealerships from per-state CSV files.
+Scrape Google Maps phone/website for dealerships from per-state enriched CSV files.
+
+Rows with Website Phone are written directly to output (no Google Maps scrape).
+All other rows are scraped for Google Map Phone / Google Map Website.
+Output is written to enriched_new/.
 
 Usage:
     python main.py -w 0 -W 4   # worker 0 of 4 (0-based worker id)
@@ -25,9 +29,15 @@ from selenium.webdriver.support.ui import WebDriverWait
 from tqdm import tqdm
 from webdriver_manager.chrome import ChromeDriverManager
 
-INPUT_DIR = Path("crawled")
-OUTPUT_DIR = Path("crawled_new")
+INPUT_DIR = Path("enriched")
+OUTPUT_DIR = Path("enriched_new")
 SKIP_FILES = {"all_dealerships.csv"}
+SKIP_NAME_SUFFIXES = ("_enriched",)
+
+WEBSITE_PHONE_COL = "Website Phone"
+INVALID_PHONE_VALUES = frozenset(
+    {"", "not specified", "n/a", "na", "none", "null", "nan"}
+)
 
 GOOGLE_MAPS_URL_COL = "google maps url"
 GOOGLE_MAP_PHONE_COL = "Google Map Phone"
@@ -106,6 +116,34 @@ def create_driver() -> webdriver.Chrome:
     return driver
 
 
+def is_valid_phone_value(value: object) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text.lower() not in INVALID_PHONE_VALUES
+
+
+def website_phone_from_row(row: pd.Series) -> str:
+    """Phone already crawled from the dealer website (Website Phone column)."""
+    if WEBSITE_PHONE_COL not in row.index:
+        return ""
+    raw = row.get(WEBSITE_PHONE_COL, "")
+    if not is_valid_phone_value(raw):
+        return ""
+    return format_us_phone(str(raw).strip())
+
+
+def apply_website_phones(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy Website Phone into Google Map Phone so Maps phone scrape is skipped."""
+    if WEBSITE_PHONE_COL not in df.columns:
+        return df
+    for idx in df.index:
+        if is_valid_phone_value(df.at[idx, GOOGLE_MAP_PHONE_COL]):
+            continue
+        existing = website_phone_from_row(df.iloc[idx])
+        if existing:
+            df.at[idx, GOOGLE_MAP_PHONE_COL] = existing
+    return df
+
+
 def extract_phone_and_website(driver: webdriver.Chrome) -> tuple[str, str]:
     website = ""
     phone = ""
@@ -135,7 +173,9 @@ def list_state_files() -> list[Path]:
     files = sorted(
         f
         for f in INPUT_DIR.glob("*.csv")
-        if f.is_file() and f.name not in SKIP_FILES
+        if f.is_file()
+        and f.name not in SKIP_FILES
+        and not any(f.stem.endswith(suffix) for suffix in SKIP_NAME_SUFFIXES)
     )
     return files
 
@@ -145,7 +185,7 @@ def states_for_worker(state_files: list[Path], worker_id: int, total_workers: in
 
 
 def read_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, dtype=str, keep_default_na=False, delimiter='|')
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
 
 
 def prepare_dataframe(source_path: Path, output_path: Path) -> pd.DataFrame:
@@ -157,7 +197,7 @@ def prepare_dataframe(source_path: Path, output_path: Path) -> pd.DataFrame:
             for col in (GOOGLE_MAPS_URL_COL, GOOGLE_MAP_PHONE_COL, GOOGLE_MAP_WEBSITE_COL):
                 if col not in existing.columns:
                     existing[col] = ""
-            return existing
+            return apply_website_phones(existing)
         print(f"  warning: {output_path.name} row count mismatch; rebuilding from source")
 
     df = source.copy()
@@ -176,14 +216,21 @@ def prepare_dataframe(source_path: Path, output_path: Path) -> pd.DataFrame:
                 df.at[idx, "Name"],
                 df.at[idx, "List Address"],
             )
-    return df
+    return apply_website_phones(df)
 
 
-def row_needs_scrape(row: pd.Series) -> bool:
-    """Skip rows already scraped (phone or website found, or retry only empty both)."""
+def row_has_website_phone(row: pd.Series) -> bool:
+    """Dealer already has a phone from website crawl — skip Maps entirely."""
+    return bool(website_phone_from_row(row))
+
+
+def row_needs_maps_scrape(row: pd.Series) -> bool:
+    """True only for rows that still need a Selenium/Google Maps visit."""
+    if row_has_website_phone(row):
+        return False
     phone = str(row.get(GOOGLE_MAP_PHONE_COL, "") or "").strip()
     website = str(row.get(GOOGLE_MAP_WEBSITE_COL, "") or "").strip()
-    return not phone and not website
+    return not is_valid_phone_value(phone) or not website
 
 
 def write_output(df: pd.DataFrame, output_path: Path) -> None:
@@ -194,13 +241,24 @@ def write_output(df: pd.DataFrame, output_path: Path) -> None:
 def process_state(source_path: Path, output_path: Path) -> None:
     state_name = source_path.stem
     df = prepare_dataframe(source_path, output_path)
-    print(f"********* {state_name} started ({len(df)} rows) *********")
+    website_phone_count = sum(1 for i in range(len(df)) if row_has_website_phone(df.iloc[i]))
+    maps_scrape_count = sum(1 for i in range(len(df)) if row_needs_maps_scrape(df.iloc[i]))
+    print(
+        f"********* {state_name} started ({len(df)} rows, "
+        f"{website_phone_count} direct-write, {maps_scrape_count} maps-scrape) *********"
+    )
 
-    driver = create_driver()
+    driver = create_driver() if maps_scrape_count else None
     try:
         for idx in tqdm(range(len(df)), desc=state_name):
             row = df.iloc[idx]
-            if not row_needs_scrape(row):
+
+            if row_has_website_phone(row):
+                df.at[idx, GOOGLE_MAP_PHONE_COL] = website_phone_from_row(row)
+                write_output(df, output_path)
+                continue
+
+            if not row_needs_maps_scrape(row):
                 continue
 
             url = row[GOOGLE_MAPS_URL_COL]
@@ -208,14 +266,16 @@ def process_state(source_path: Path, output_path: Path) -> None:
                 url = build_google_maps_url(row.get("Name"), row.get("List Address"))
                 df.at[idx, GOOGLE_MAPS_URL_COL] = url
 
-            phone, website = "", ""
+            phone = ""
+            website = ""
             try:
                 driver.get(url)
                 phone, website = extract_phone_and_website(driver)
             except Exception as exc:
                 print(f"  row {idx}: scrape error: {exc}")
 
-            df.at[idx, GOOGLE_MAP_PHONE_COL] = phone
+            if is_valid_phone_value(phone):
+                df.at[idx, GOOGLE_MAP_PHONE_COL] = phone
             df.at[idx, GOOGLE_MAP_WEBSITE_COL] = website
             write_output(df, output_path)
 
@@ -223,7 +283,8 @@ def process_state(source_path: Path, output_path: Path) -> None:
                 cleanup_memory()
                 print(f"  memory: {get_memory_usage_mb():.1f} MB")
     finally:
-        driver.quit()
+        if driver is not None:
+            driver.quit()
 
     print(f"********* {state_name} finished -> {output_path} *********")
 

@@ -145,7 +145,7 @@ def states_for_worker(state_files: list[Path], worker_id: int, total_workers: in
 
 
 def read_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, dtype=str, keep_default_na=False)
+    return pd.read_csv(path, dtype=str, keep_default_na=False, delimiter='|')
 
 
 def prepare_dataframe(source_path: Path, output_path: Path) -> pd.DataFrame:
